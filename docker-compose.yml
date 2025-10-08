@@ -1,0 +1,109 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: task_queue
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./01-init-user.sql:/docker-entrypoint-initdb.d/01-init-user.sql
+      - ./02-schema.sql:/docker-entrypoint-initdb.d/02-schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d task_queue"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Redis for message broker and caching
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # FastAPI Application
+  api:
+    build: .
+    command: uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    environment:
+      - DATABASE_URL=postgresql://user:password@postgres:5432/task_queue
+      - DATABASE_URL_ASYNC=postgresql+asyncpg://user:password@postgres:5432/task_queue
+      - REDIS_URL=redis://redis:6379/0
+      - API_RELOAD=true
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Celery Worker
+  worker:
+    build: .
+    command: celery -A src.worker.main worker --loglevel=info --concurrency=4
+    volumes:
+      - .:/app
+    environment:
+      - DATABASE_URL=postgresql://user:password@postgres:5432/task_queue
+      - DATABASE_URL_ASYNC=postgresql+asyncpg://user:password@postgres:5432/task_queue
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Celery Beat Scheduler
+  scheduler:
+    build: .
+    command: celery -A src.worker.main beat --loglevel=info
+    volumes:
+      - .:/app
+    environment:
+      - DATABASE_URL=postgresql://user:password@postgres:5432/task_queue
+      - DATABASE_URL_ASYNC=postgresql+asyncpg://user:password@postgres:5432/task_queue
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Celery Flower (Task Monitoring)
+  flower:
+    build: .
+    command: celery -A src.worker.main flower --port=5555
+    ports:
+      - "5555:5555"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
